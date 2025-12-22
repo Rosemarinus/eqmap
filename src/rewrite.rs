@@ -22,7 +22,10 @@ use std::sync::OnceLock; // Rust 1.70+
 /// 1. DSD 缓存: (Program, K) -> List of valid (i, j) pairs
 /// 仅当开启 dyn_decomp 时编译 DSD 相关缓存
 #[cfg(feature = "dyn_decomp")]
-static DSD_CACHE: OnceLock<Mutex<HashMap<(u64, usize), Vec<(u8, u8)>>>> = OnceLock::new();
+type DsdCacheMap = HashMap<(u64, usize), Vec<(u8, u8)>>;
+
+#[cfg(feature = "dyn_decomp")]
+static DSD_CACHE: OnceLock<Mutex<DsdCacheMap>> = OnceLock::new();
 
 /// Retrieves the cached Disjoint Support Decomposition (DSD) pairs for a given truth table.
 /// Returns a list of (mask, residue) pairs representing the decomposition.
@@ -2030,20 +2033,20 @@ mod tests {
         let mut reduced_prog = 0;
 
         for node in &egraph[class_id].nodes {
-            if let LutLang::Lut(children) = node {
-                if children.len() == 3 {
-                    // 2-LUT
-                    found_reduced_lut = true;
-                    // 获取新 Program
-                    if let Ok(p) = egraph[children[0]].data.get_program() {
-                        reduced_prog = p;
-                    }
-                    reduced_inputs = children[1..].to_vec();
-                    println!(
-                        "Found Reduced LUT: Program=0x{:x}, Inputs={:?}",
-                        reduced_prog, reduced_inputs
-                    );
+            if let LutLang::Lut(children) = node
+                && children.len() == 3
+            {
+                // 2-LUT
+                found_reduced_lut = true;
+                // 获取新 Program
+                if let Ok(p) = egraph[children[0]].data.get_program() {
+                    reduced_prog = p;
                 }
+                reduced_inputs = children[1..].to_vec();
+                println!(
+                    "Found Reduced LUT: Program=0x{:x}, Inputs={:?}",
+                    reduced_prog, reduced_inputs
+                );
             }
         }
 

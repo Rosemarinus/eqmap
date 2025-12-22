@@ -140,8 +140,6 @@ impl Analysis<lut::LutLang> for LutAnalysis {
     type Data = LutAnalysisData;
 
     fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
-        // println!("[MERGE] merging two classes...");
-
         // if to.program != from.program {
         //     panic!("Tried to merge two different programs");
         // }
@@ -149,48 +147,35 @@ impl Analysis<lut::LutLang> for LutAnalysis {
         //     panic!("Tried to merge two conflicting bus sizes");
         // }
 
-        // // 1. Program 检查：只有当两者都有值，且值不同时，才 Panic
-        // if let (Some(p1), Some(p2)) = (to.program, from.program) {
-        //     if p1 != p2 {
-        //         panic!(
-        //             "Tried to merge two different programs: {:x} vs {:x}",
-        //             p1, p2
-        //         );
-        //     }
-        // }
-
         // 1. Program Merge Check (Relaxed)
         // 允许 Some(A) 和 None 合并 (保留 A)
-        // 允许 Some(A) 和 Some(A) 合并
         // 如果 Some(A) 和 Some(B) 冲突，打印警告但不 Panic (保留 A)
-        if to.program.is_some() && from.program.is_some() {
-            if to.program != from.program {
-                // println!("[WARN] Program conflict in merge: {:?} vs {:?}", to.program, from.program);
-                // 实际运行中，NPN 规则可能会导致这种冲突 (LUT vs CANON with unexpected flow)，
-                // 只要 npn_class 一致，我们就可以容忍 program 的不一致。
-            }
+        if to.program.is_some() && from.program.is_some() && to.program != from.program {
+            // println!("[WARN] Program conflict in merge: {:?} vs {:?}", to.program, from.program);
+            // 实际运行中，NPN 规则可能会导致这种冲突，
+            // 只要 npn_class 一致，我们就可以容忍 program 的不一致。
         }
 
         // 2. Size 检查 (同理)
-        if let (Some(s1), Some(s2)) = (to.size, from.size) {
-            if s1 != s2 {
-                panic!("Tried to merge two conflicting bus sizes");
-            }
+        if let (Some(s1), Some(s2)) = (to.size, from.size)
+            && s1 != s2
+        {
+            panic!("Tried to merge two conflicting bus sizes");
         }
 
         // 3. NPN 检查
-        if let (Some(n1), Some(n2)) = (to.npn_class, from.npn_class) {
-            if n1 != n2 {
-                // 不应panic
-                // panic!(
-                //     "CRITICAL: Merging nodes with different NPN signatures! {:x} vs {:x}",
-                //     n1, n2
-                // );
-                // println!(
-                //     "[WARN] Merging nodes with different NPN signatures: {:x} vs {:x}",
-                //     n1, n2
-                // );
-            }
+        if let (Some(n1), Some(n2)) = (to.npn_class, from.npn_class)
+            && n1 != n2
+        {
+            // 不应panic
+            // panic!(
+            //     "CRITICAL: Merging nodes with different NPN signatures! {:x} vs {:x}",
+            //     n1, n2
+            // );
+            // println!(
+            //     "[WARN] Merging nodes with different NPN signatures: {:x} vs {:x}",
+            //     n1, n2
+            // );
         }
 
         if !(to.const_val == from.const_val || to.const_val.is_none() || from.const_val.is_none()) {
@@ -248,11 +233,7 @@ impl Analysis<lut::LutLang> for LutAnalysis {
         };
 
         // NPN 计算 (Canonical 节点也需要计算 NPN，以便在 merge 时进行一致性检查)
-        let npn_sig = if let Some(p) = program_val {
-            Some(get_npn_transform(p, k).canon_prog)
-        } else {
-            None
-        };
+        let npn_sig = program_val.map(|p| get_npn_transform(p, k).canon_prog);
 
         // 3. Construct Data (Original Logic Preserved)
         // -------------------------------------------------------------
