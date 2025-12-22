@@ -1,9 +1,36 @@
 // build.rs
+use std::path::Path;
+use std::process::Command;
+
 fn main() {
     // 定义路径变量
     let npn_dir = "NPN";
     let abc_dir = format!("{}/abc", npn_dir);
     let wrapper_file = format!("{}/npn_wrapper.cpp", npn_dir);
+    let lib_path = format!("{}/libabc.a", abc_dir);
+
+    // -------------------------------------------------------
+    // 0. 自动检测并编译 ABC 静态库
+    // -------------------------------------------------------
+    // 这一步是为了解决 CI (GitHub Actions) 上没有 libabc.a 的问题，
+    // 同时也方便新用户 clone 后直接 cargo build。
+    if !Path::new(&lib_path).exists() {
+        println!(
+            "cargo:warning=ABC library not found. Compiling libabc.a automatically (this may take a while)..."
+        );
+
+        // 调用 make libabc.a -j4
+        let status = Command::new("make")
+            .arg("libabc.a") // 只编译静态库，不要编译整个 abc 可执行文件
+            .arg("-j4") // 并行编译加速
+            .current_dir(&abc_dir)
+            .status()
+            .expect("Failed to execute make command");
+
+        if !status.success() {
+            panic!("Failed to build ABC library! Make sure you have 'make' and 'gcc' installed.");
+        }
+    }
 
     // -------------------------------------------------------
     // 1. 编译 C++ Wrapper
@@ -48,5 +75,5 @@ fn main() {
     // 4. 重建触发条件
     // -------------------------------------------------------
     println!("cargo:rerun-if-changed={}", wrapper_file);
-    println!("cargo:rerun-if-changed={}/libabc.a", abc_dir);
+    println!("cargo:rerun-if-changed={}", lib_path);
 }
