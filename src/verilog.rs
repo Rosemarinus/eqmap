@@ -1927,50 +1927,104 @@ impl fmt::Display for SVModule {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let level = 0;
         let indent = " ".repeat(level);
-        let mut already_decl: HashSet<String> = HashSet::new();
-        writeln!(f, "{}module {} (", indent, self.name)?;
-        for input in self.inputs.iter() {
-            if already_decl.contains(&input.name) {
-                continue;
+
+        // 1. 收集并排序 Inputs
+        // 使用 HashSet 辅助去重，并收集到 Vec 中排序
+        let mut seen_inputs = HashSet::new();
+        let mut sorted_inputs = Vec::new();
+        for input in &self.inputs {
+            if !seen_inputs.contains(&input.name) {
+                seen_inputs.insert(input.name.clone());
+                sorted_inputs.push(input);
             }
-            let indent = " ".repeat(level + 4);
-            writeln!(f, "{}{},", indent, emit_id(input.name.clone()))?;
-            already_decl.insert(input.name.clone());
         }
-        for (i, output) in self.outputs.iter().enumerate() {
+        // [关键修复] 按名称排序
+        sorted_inputs.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // 2. 收集并排序 Outputs
+        let mut seen_outputs = HashSet::new();
+        let mut sorted_outputs = Vec::new();
+        for output in &self.outputs {
+            if !seen_outputs.contains(&output.name) {
+                seen_outputs.insert(output.name.clone());
+                sorted_outputs.push(output);
+            }
+        }
+        sorted_outputs.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // 3. 打印 Module Header
+        writeln!(f, "{}module {} (", indent, self.name)?;
+
+        let total_ports = sorted_inputs.len() + sorted_outputs.len();
+        let mut printed_count = 0;
+
+        // 先打印 Inputs
+        for input in &sorted_inputs {
+            let indent = " ".repeat(level + 4);
+            write!(f, "{}{}", indent, emit_id(input.name.clone()))?;
+            if printed_count < total_ports - 1 {
+                writeln!(f, ",")?;
+            } else {
+                writeln!(f)?;
+            }
+            printed_count += 1;
+        }
+
+        // 再打印 Outputs
+        for output in &sorted_outputs {
             let indent = " ".repeat(level + 4);
             write!(f, "{}{}", indent, emit_id(output.name.clone()))?;
-            if i == self.outputs.len() - 1 {
-                writeln!(f)?;
-            } else {
+            if printed_count < total_ports - 1 {
                 writeln!(f, ",")?;
+            } else {
+                writeln!(f)?;
             }
+            printed_count += 1;
         }
         writeln!(f, "{indent});")?;
-        already_decl.clear();
-        for input in self.inputs.iter() {
-            if already_decl.contains(&input.name) {
-                continue;
-            }
+
+        // 4. 打印 Declarations (Input/Output/Wire)
+        // 记录所有已声明的信号，防止后续 wire 重复声明
+        let mut already_decl = HashSet::new();
+
+        for input in &sorted_inputs {
             let indent = " ".repeat(level + 2);
             writeln!(f, "{}input {};", indent, emit_id(input.name.clone()))?;
             writeln!(f, "{}wire {};", indent, emit_id(input.name.clone()))?;
             already_decl.insert(input.name.clone());
         }
-        for output in self.outputs.iter() {
+
+        for output in &sorted_outputs {
             let indent = " ".repeat(level + 2);
             writeln!(f, "{}output {};", indent, emit_id(output.name.clone()))?;
             writeln!(f, "{}wire {};", indent, emit_id(output.name.clone()))?;
             already_decl.insert(output.name.clone());
         }
-        for signal in self.signals.iter() {
-            let indent = " ".repeat(level + 2);
+
+        // 5. 收集并排序剩余的 Wires (Signals)
+        let mut sorted_signals = Vec::new();
+        for signal in &self.signals {
             if !already_decl.contains(&signal.name) {
+                sorted_signals.push(signal);
+            }
+        }
+        // [关键修复] 去重并排序
+        sorted_signals.sort_by(|a, b| a.name.cmp(&b.name));
+        sorted_signals.dedup_by(|a, b| a.name == b.name);
+
+        for signal in sorted_signals {
+            if !already_decl.contains(&signal.name) {
+                let indent = " ".repeat(level + 2);
                 writeln!(f, "{}wire {};", indent, emit_id(signal.name.clone()))?;
                 already_decl.insert(signal.name.clone());
             }
         }
-        for instance in self.instances.iter() {
+
+        // 6. 打印 Instances (也排序，保证确定性)
+        let mut sorted_instances: Vec<&SVPrimitive> = self.instances.iter().collect();
+        sorted_instances.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for instance in sorted_instances {
             writeln!(f, "{instance}")?;
         }
         writeln!(f, "{indent}endmodule")

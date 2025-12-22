@@ -10,7 +10,7 @@ permissions:
 jobs:
   build:
     name: Build HTML Docs
-    if: github.repository == 'Rosemarinus/eqmap'
+    if: github.event.repository.private == false && github.repository == 'Rosemarinus/eqmap'
     runs-on: ubuntu-latest
 
     steps:
