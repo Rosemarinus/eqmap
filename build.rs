@@ -12,17 +12,18 @@ fn main() {
     // -------------------------------------------------------
     // 0. 自动检测并编译 ABC 静态库
     // -------------------------------------------------------
-    // 这一步是为了解决 CI (GitHub Actions) 上没有 libabc.a 的问题，
-    // 同时也方便新用户 clone 后直接 cargo build。
     if !Path::new(&lib_path).exists() {
         println!(
             "cargo:warning=ABC library not found. Compiling libabc.a automatically (this may take a while)..."
         );
 
-        // 调用 make libabc.a -j4
+        // 调用 make libabc.a -j4 ABC_USE_NO_READLINE=1
         let status = Command::new("make")
-            .arg("libabc.a") // 只编译静态库，不要编译整个 abc 可执行文件
-            .arg("-j4") // 并行编译加速
+            .arg("libabc.a")
+            .arg("-j4")
+            // 显式告诉 ABC 的 Makefile 不要用 readline
+            // 跳过 mainUtils.c 里的报错头文件, 让 GitHub Actions 能通过
+            .arg("ABC_USE_NO_READLINE=1")
             .current_dir(&abc_dir)
             .status()
             .expect("Failed to execute make command");
@@ -36,17 +37,12 @@ fn main() {
     // 1. 编译 C++ Wrapper
     // -------------------------------------------------------
     cc::Build::new()
-        .cpp(true) // 启用 C++ 模式
-        .file(&wrapper_file) // 你的 wrapper源文件
-        .include(format!("{}/src", abc_dir)) // 包含 ABC 头文件路径
-        // === 关键修复开始 ===
-        // ABC 需要这个宏来识别 64位 环境 (Linux/macOS 64-bit 都通用这个)
-        // 如果没有它，abc_global.h 就会报 unknown platform
+        .cpp(true)
+        .file(&wrapper_file)
+        .include(format!("{}/src", abc_dir))
         .define("LIN64", None)
-        // 可选：禁用 Readline，防止后续链接时报 readline 相关的错
+        // 确保 wrapper 编译时也没开启 readline
         .define("ABC_NO_USE_READLINE", None)
-        // === 关键修复结束 ===
-        // 屏蔽一些来自 ABC 头文件的陈旧警告 (sprintf deprecated 等)，让输出干净点
         .flag_if_supported("-Wno-deprecated-declarations")
         .flag_if_supported("-Wno-unused-parameter")
         .compile("npn_wrapper");
@@ -64,9 +60,8 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=stdc++");
 
     #[cfg(target_os = "macos")]
-    println!("cargo:rustc-link-lib=dylib=c++"); // Mac 上通常是 libc++
+    println!("cargo:rustc-link-lib=dylib=c++");
 
-    // ABC 依赖的其他系统库
     println!("cargo:rustc-link-lib=dylib=m");
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=pthread");
