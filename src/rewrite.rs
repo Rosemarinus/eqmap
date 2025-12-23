@@ -568,6 +568,14 @@ impl Applier<lut::LutLang, LutAnalysis> for ToCanonicalApplier {
         };
         let clean_p = p_val & mask;
 
+        // [FIX] 关键修复：忽略常量 LUT
+        // 如果 LUT 本身已经是全0 (False) 或全1 (True)，不需要进行 NPN 规范化。
+        // constant_luts 规则会负责把它们优化成 Const 节点。
+        // 强行做 NPN 可能会导致 output_phase 计算错误或结构冗余。
+        if clean_p == 0 || clean_p == mask {
+            return vec![];
+        }
+
         // [Optimize] Use cached NPN with masked program
         let transform = get_cached_npn(clean_p, k);
         // Note: canon_prog from transform might be stretched, mask it before use
@@ -631,6 +639,273 @@ impl Applier<lut::LutLang, LutAnalysis> for ToCanonicalApplier {
     }
 }
 
+/// An Applier that removes unused inputs from a LUT.
+/// Example: (LUT 160 a b c) -> (LUT 8 a c) if b is unused.
+#[derive(Debug, Clone)]
+pub struct RemoveUnusedInput;
+
+impl Applier<lut::LutLang, LutAnalysis> for RemoveUnusedInput {
+    fn apply_one(
+        &self,
+        egraph: &mut egg::EGraph<lut::LutLang, LutAnalysis>,
+        eclass: egg::Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<lut::LutLang>>,
+        _rule_name: egg::Symbol,
+    ) -> Vec<egg::Id> {
+        let mut program = 0u64;
+        let mut inputs = Vec::new();
+
+        // 1. 获取当前 LUT 的 Program 和 输入
+        for node in &egraph[eclass].nodes {
+            if let lut::LutLang::Lut(children) = node {
+                if let Ok(p) = egraph[children[0]].data.get_program() {
+                    program = p;
+                } else {
+                    continue;
+                }
+                inputs = children[1..].to_vec();
+                break;
+            }
+        }
+
+        if inputs.is_empty() {
+            return vec![];
+        }
+        let k = inputs.len();
+
+        // 2. 遍历检查每个输入是否冗余
+        for i in 0..k {
+            let bit_idx = k - 1 - i;
+
+            let mut is_unused = true;
+            let check_limit = 1 << k;
+
+            for val in 0..check_limit {
+                if (val >> bit_idx) & 1 == 0 {
+                    let val_pair = val | (1 << bit_idx);
+                    let out1 = (program >> val) & 1;
+                    let out2 = (program >> val_pair) & 1;
+                    if out1 != out2 {
+                        is_unused = false;
+                        break;
+                    }
+                }
+            }
+
+            if is_unused {
+                // 3. 构建新的 Program
+                let mut new_program = 0u64;
+                let mut insert_ptr = 0;
+                for val in 0..check_limit {
+                    if (val >> bit_idx) & 1 == 0 {
+                        let out = (program >> val) & 1;
+                        new_program |= out << insert_ptr;
+                        insert_ptr += 1;
+                    }
+                }
+
+                // 4. 构建新 Inputs 列表
+                let mut new_inputs = inputs.clone();
+                new_inputs.remove(i);
+
+                // [FIX] 检查是否所有输入都被移除了 (变成常量)
+                if new_inputs.is_empty() {
+                    // 如果 Program 的第 0 位是 1，则是 True，否则是 False
+                    let const_val = (new_program & 1) != 0;
+                    // 注意：这里假设你的 LutLang 有 Const 变体。
+                    // 如果没有，你需要根据你的 enum 定义修改 (例如 (LUT 3) for true)
+                    // 查看 constant_luts 规则，通常 egraph 会自动处理 Const(bool)
+                    let const_node = egraph.add(lut::LutLang::Const(const_val));
+                    if egraph.union(eclass, const_node) {
+                        return vec![const_node];
+                    } else {
+                        return vec![];
+                    }
+                }
+
+                // 5. 添加新节点
+                let new_prog_id = egraph.add(lut::LutLang::Program(new_program));
+                let mut new_children = vec![new_prog_id];
+                new_children.extend(new_inputs);
+
+                let new_lut = egraph.add(lut::LutLang::Lut(new_children.into()));
+
+                if egraph.union(eclass, new_lut) {
+                    return vec![new_lut];
+                }
+            }
+        }
+
+        vec![]
+    }
+}
+
+/// A "Smart" Shannon expansion that only triggers when it significantly simplifies the logic.
+#[derive(Debug, Clone)]
+pub struct SmartShannon;
+
+impl Applier<lut::LutLang, LutAnalysis> for SmartShannon {
+    fn apply_one(
+        &self,
+        egraph: &mut egg::EGraph<lut::LutLang, LutAnalysis>,
+        eclass: egg::Id,
+        _subst: &Subst,                                   // [FIX] Unused variable
+        _searcher_ast: Option<&PatternAst<lut::LutLang>>, // [FIX] Unused variable
+        _rule_name: egg::Symbol,                          // [FIX] Unused variable
+    ) -> Vec<egg::Id> {
+        let mut program = 0u64;
+        let mut inputs = Vec::new();
+
+        for node in &egraph[eclass].nodes {
+            if let lut::LutLang::Lut(children) = node {
+                if let Ok(p) = egraph[children[0]].data.get_program() {
+                    program = p;
+                } else {
+                    continue;
+                }
+                inputs = children[1..].to_vec();
+                break;
+            }
+        }
+
+        if inputs.len() < 3 {
+            return vec![];
+        }
+        let k = inputs.len();
+
+        for i in 0..k {
+            let bit_idx = k - 1 - i;
+
+            let mut p0 = 0u64;
+            let mut p1 = 0u64;
+            let half_size = 1 << (k - 1);
+
+            for row in 0..half_size {
+                let low_mask = (1 << bit_idx) - 1;
+                let high_part = (row & !low_mask) << 1;
+                let low_part = row & low_mask;
+                let idx0 = high_part | low_part;
+                let idx1 = idx0 | (1 << bit_idx);
+
+                if (program >> idx0) & 1 == 1 {
+                    p0 |= 1 << row;
+                }
+                if (program >> idx1) & 1 == 1 {
+                    p1 |= 1 << row;
+                }
+            }
+
+            let supp0 = count_effective_inputs(p0, k - 1);
+            let supp1 = count_effective_inputs(p1, k - 1);
+
+            if supp0 <= (k - 2) && supp1 <= (k - 2) {
+                let p0_id = egraph.add(lut::LutLang::Program(p0));
+                let p1_id = egraph.add(lut::LutLang::Program(p1));
+
+                let mut child_inputs = inputs.clone();
+                child_inputs.remove(i);
+
+                let mut c0_vec = vec![p0_id];
+                c0_vec.extend(child_inputs.clone());
+                let lut0 = egraph.add(lut::LutLang::Lut(c0_vec.into()));
+
+                let mut c1_vec = vec![p1_id];
+                c1_vec.extend(child_inputs);
+                let lut1 = egraph.add(lut::LutLang::Lut(c1_vec.into()));
+
+                let sel = inputs[i];
+
+                // [FIX] E0499: 必须先把 MUX 的 Program 节点加上，拿到 ID
+                // 否则如果在下面的 vec![] 里直接调用 egraph.add，会和外层的 egraph.add 冲突
+                let mux_prog_id = egraph.add(lut::LutLang::Program(202));
+
+                let mux_lut = egraph.add(lut::LutLang::Lut(
+                    vec![
+                        mux_prog_id, // 使用提取出来的 ID
+                        sel,
+                        lut1, // high
+                        lut0, // low
+                    ]
+                    .into(),
+                ));
+
+                if egraph.union(eclass, mux_lut) {
+                    return vec![mux_lut];
+                }
+            }
+        }
+        vec![]
+    }
+}
+
+// 辅助函数：计算真值表的有效输入数量
+fn count_effective_inputs(prog: u64, k: usize) -> usize {
+    let mut cnt = 0;
+    for i in 0..k {
+        let bit_idx = i;
+        let limit = 1 << k;
+        let mut dependent = false;
+        for val in 0..limit {
+            if (val >> bit_idx) & 1 == 0 {
+                let neighbor = val | (1 << bit_idx);
+                if ((prog >> val) & 1) != ((prog >> neighbor) & 1) {
+                    dependent = true;
+                    break;
+                }
+            }
+        }
+        if dependent {
+            cnt += 1;
+        }
+    }
+    cnt
+}
+
+/// Returns rules that remove unused inputs from LUTs.
+pub fn remove_unused_rules() -> Vec<Rewrite<lut::LutLang, LutAnalysis>> {
+    let mut rules = Vec::new();
+    for k in 2..=6 {
+        let vars = (0..k)
+            .map(|i| format!("?v{}", i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let pattern_str = format!("(LUT ?p {})", vars);
+
+        let pattern = pattern_str.parse::<Pattern<lut::LutLang>>().unwrap();
+
+        rules.push(
+            Rewrite::new(
+                format!("lut{}-remove-unused", k),
+                pattern,
+                RemoveUnusedInput,
+            )
+            .expect("Failed to create remove-unused rule"),
+        );
+    }
+    rules
+}
+
+/// Returns rules for "Smart" Shannon decomposition.
+pub fn smart_shannon_rules() -> Vec<Rewrite<lut::LutLang, LutAnalysis>> {
+    let mut rules = Vec::new();
+    for k in 4..=6 {
+        let vars = (0..k)
+            .map(|i| format!("?v{}", i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let pattern_str = format!("(LUT ?p {})", vars);
+
+        let pattern = pattern_str.parse::<Pattern<lut::LutLang>>().unwrap();
+
+        rules.push(
+            Rewrite::new(format!("lut{}-smart-shannon", k), pattern, SmartShannon)
+                .expect("Failed to create smart-shannon rule"),
+        );
+    }
+    rules
+}
+
 //  这里似乎不应该打开将CANON写回的规则，否则会导致LUT数量变多
 /// Generates rewrite rules for NPN canonicalization.
 /// Converts LUTs into their canonical NPN form to maximize structural sharing.
@@ -668,13 +943,13 @@ pub fn all_static_rules(bidirectional: bool) -> Vec<Rewrite<lut::LutLang, LutAna
     rules.push(rewrite!("double-complement"; "(NOT (NOT ?a))" => "?a"));
 
     // LUT permutation groups
-    rules.append(&mut permute_groups());
+    // rules.append(&mut permute_groups());
 
     rules.append(&mut redundant_inputs());
     rules.append(&mut condense_cofactors());
     rules.append(&mut general_cut_fusion());
     rules.append(&mut known_decompositions());
-    rules.append(&mut npn_canon_rules());
+    // rules.append(&mut npn_canon_rules());
 
     // Feature-gated DSD
     // #[cfg(feature = "dyn_decomp")]
@@ -684,6 +959,12 @@ pub fn all_static_rules(bidirectional: bool) -> Vec<Rewrite<lut::LutLang, LutAna
     // rules.append(&mut dyn_decompositions(false));
 
     rules.append(&mut invert_lut_rules());
+
+    rules.append(&mut remove_unused_rules());
+
+    // 可能导致震荡？总之会让时间显著变长
+    // 目的是把类似(64'hf0f0ccccff00aaaa)分解成小的
+    // rules.append(&mut smart_shannon_rules());
 
     rules
 }

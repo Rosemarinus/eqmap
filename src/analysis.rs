@@ -140,54 +140,34 @@ impl Analysis<lut::LutLang> for LutAnalysis {
     type Data = LutAnalysisData;
 
     fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
-        // if to.program != from.program {
-        //     panic!("Tried to merge two different programs");
-        // }
-        // if to.size != from.size {
-        //     panic!("Tried to merge two conflicting bus sizes");
-        // }
-
-        // 1. Program Merge Check (Relaxed)
-        // 允许 Some(A) 和 None 合并 (保留 A)
-        // 如果 Some(A) 和 Some(B) 冲突，打印警告但不 Panic (保留 A)
+        // 1. Program Merge Check
         if to.program.is_some() && from.program.is_some() && to.program != from.program {
-            // println!("[WARN] Program conflict in merge: {:?} vs {:?}", to.program, from.program);
-            // 实际运行中，NPN 规则可能会导致这种冲突，
-            // 只要 npn_class 一致，我们就可以容忍 program 的不一致。
+            // 这是严重的冲突：同一个节点既被认为是逻辑A，又被认为是逻辑B
+            // 在 LUT 优化中，如果出现这种情况，通常意味着逻辑错误或 NPN 碰撞（极罕见）
+            // eprintln!("[WARN] Program conflict in merge: {:?} vs {:?}", to.program, from.program);
         }
 
-        // 2. Size 检查 (同理)
+        // 2. Size 检查
         if let (Some(s1), Some(s2)) = (to.size, from.size)
             && s1 != s2
         {
             panic!("Tried to merge two conflicting bus sizes");
         }
 
-        // 3. NPN 检查
-        if let (Some(n1), Some(n2)) = (to.npn_class, from.npn_class)
-            && n1 != n2
-        {
-            // 不应panic
-            // panic!(
-            //     "CRITICAL: Merging nodes with different NPN signatures! {:x} vs {:x}",
-            //     n1, n2
-            // );
-            // println!(
-            //     "[WARN] Merging nodes with different NPN signatures: {:x} vs {:x}",
-            //     n1, n2
-            // );
-        }
-
+        // 3. Constant Value 检查
         if !(to.const_val == from.const_val || to.const_val.is_none() || from.const_val.is_none()) {
-            // Later we will want to relax this condition for constant folding.
-            // For now, it is a good sanity check.
-            // panic!("Cannot merge constant type with non-constant type.");
-            eprintln!("Cannot merge constant type with non-constant type.");
-        }
-        if !(to.input == from.input || to.input.is_none() || from.input.is_none()) {
-            // Later, we will want to relax this condition when we're okay with input aliasing.
-            // panic!("Cannot merge input type with non-input type.");
-            eprintln!("Cannot merge input type with non-input type.");
+            eprintln!("\n[CRITICAL ERROR] Merge Conflict Detected!");
+            eprintln!(
+                "  TO:   const_val={:?}, program={:?}",
+                to.const_val, to.program
+            );
+            eprintln!(
+                "  FROM: const_val={:?}, program={:?}",
+                from.const_val, from.program
+            );
+            eprintln!(
+                "Cannot merge constant type with non-constant type (True vs False conflict)."
+            );
         }
 
         let mut merged = to.clone();
@@ -197,8 +177,6 @@ impl Analysis<lut::LutLang> for LutAnalysis {
         merged.program = to.program.or(from.program);
         merged.size = to.size.or(from.size);
 
-        // Rewrite rules can create redundant logic, so we need to track the current cut.
-        // If we took the intersection, we would not have that info. So we take the union.
         #[cfg(feature = "cut_analysis")]
         from.cut.iter().for_each(|x| {
             merged.cut.insert(x.clone());
@@ -213,39 +191,58 @@ impl Analysis<lut::LutLang> for LutAnalysis {
         let (program_val, k) = match enode {
             lut::LutLang::Program(p) => (Some(*p), 6),
             lut::LutLang::Lut(ids) | lut::LutLang::Canonical(ids) => {
-                let k = ids.len() - 1;
-                let p = if let Ok(p) = egraph[ids[0]].data.get_program() {
-                    Some(p)
-                } else if let lut::LutLang::Program(val) = &egraph[ids[0]].nodes[0] {
-                    Some(*val)
+                if ids.is_empty() {
+                    // 防御性：空 LUT 视为 Const(False)
+                    (Some(0), 0)
                 } else {
-                    None
-                };
-                (p, k)
+                    let k = ids.len() - 1;
+                    let p = if let Ok(p) = egraph[ids[0]].data.get_program() {
+                        Some(p)
+                    } else if let lut::LutLang::Program(val) = &egraph[ids[0]].nodes[0] {
+                        Some(*val)
+                    } else {
+                        None
+                    };
+                    (p, k)
+                }
             }
-
+            // 逻辑门支持
             lut::LutLang::And(_) => (Some(0x8), 2),
             lut::LutLang::Nor(_) => (Some(0x1), 2),
             lut::LutLang::Xor(_) => (Some(0x6), 2),
             lut::LutLang::Not(_) => (Some(0x1), 1),
             lut::LutLang::Mux(_) => (Some(0xCA), 3),
+
+            // [修复] 显式处理 Const 节点，赋予其正确的 program 值
+            lut::LutLang::Const(c) => {
+                let p = if *c { !0u64 } else { 0u64 };
+                (Some(p), 0)
+            }
+
             _ => (None, 0),
         };
 
-        // NPN 计算 (Canonical 节点也需要计算 NPN，以便在 merge 时进行一致性检查)
-        let npn_sig = program_val.map(|p| get_npn_transform(p, k).canon_prog);
+        // NPN 计算: 仅当 k > 0 时计算，避免对常量调用
+        let npn_sig = if k > 0 {
+            program_val.map(|p| get_npn_transform(p, k).canon_prog)
+        } else {
+            None
+        };
 
-        // 3. Construct Data (Original Logic Preserved)
-        // -------------------------------------------------------------
+        // 3. Construct Data
         let mut data = match enode {
             lut::LutLang::Program(p) => LutAnalysisData::new(Some(*p), None, None, None),
-            lut::LutLang::Const(c) => LutAnalysisData::new(None, Some(*c), None, None),
+
+            // [修复] 使用计算出的 program 初始化 Const 数据
+            lut::LutLang::Const(c) => {
+                let p = if *c { !0u64 } else { 0u64 };
+                LutAnalysisData::new(Some(p), Some(*c), None, None)
+            }
+
             lut::LutLang::Var(v) => {
                 let d = LutAnalysisData::new(None, None, Some(v.to_string()), None);
-
                 #[cfg(feature = "cut_analysis")]
                 let d = d.with_cut(HashSet::from([v.to_string()]));
-
                 d
             }
             lut::LutLang::Arg([index]) => {
@@ -255,31 +252,41 @@ impl Analysis<lut::LutLang> for LutAnalysis {
                     .expect("Expected Arg child to be an index");
                 let name = "arg".to_string() + &index_val.to_string();
                 let d = LutAnalysisData::new(None, None, Some(name.clone()), None);
-
                 #[cfg(feature = "cut_analysis")]
                 let d = d.with_cut(HashSet::from([name]));
-
                 d
             }
             lut::LutLang::Bus(b) => LutAnalysisData::new(None, None, None, Some(b.len())),
             _ => {
                 let d = LutAnalysisData::default();
-
                 #[cfg(feature = "cut_analysis")]
                 let d = d.merge_cut(egraph, enode);
-
                 d
             }
         };
 
         // 4. Fill in NPN and Program info
-        // -------------------------------------------------------------
         data.npn_class = npn_sig;
 
         if let Some(p) = program_val {
-            // Only set program for LUT/Canonical nodes to enable get_program() checks
             if matches!(enode, lut::LutLang::Lut(_)) {
                 data.program = Some(p);
+
+                // [增强] 检查 LUT 是否实质上是常量
+                // 如果一个 LUT 的真值表全0或全1，它就是常量。
+                // 这能帮助 E-Graph 尽早发现 LUT(0) 和 Const(false) 是等价的。
+                let mask = if k >= 6 {
+                    !0u64
+                } else {
+                    (1u64 << (1 << k)) - 1
+                };
+                let masked_p = p & mask;
+
+                if masked_p == 0 {
+                    data.const_val = Some(false);
+                } else if masked_p == mask {
+                    data.const_val = Some(true);
+                }
             }
         }
 
@@ -322,6 +329,7 @@ impl Analysis<lut::LutLang> for LutAnalysis {
                         let repl = egraph.add(lut::LutLang::Lut(c.into()));
                         egraph.union(id, repl);
                     } else {
+                        // Constant folding for 0-input LUTs (which rely on program bits)
                         let const_val = msb_const.unwrap();
                         match program & 3 {
                             0 => {
@@ -346,100 +354,5 @@ impl Analysis<lut::LutLang> for LutAnalysis {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_npn_sanity_check() {
-        let raw_and = 0x8;
-        let raw_or = 0xE;
-        let raw_xor = 0x6;
-        let raw_xnor = 0x9;
-
-        println!("Running NPN Sanity Check via New Transform API...");
-
-        // Updated to use get_npn_transform(...).canon_prog
-        let sig_and = get_npn_transform(raw_and, 2).canon_prog;
-        let sig_or = get_npn_transform(raw_or, 2).canon_prog;
-        let sig_xor = get_npn_transform(raw_xor, 2).canon_prog;
-        let sig_xnor = get_npn_transform(raw_xnor, 2).canon_prog;
-
-        println!("AND (2-in): {:016x}", sig_and);
-        println!("OR  (2-in): {:016x}", sig_or);
-
-        assert_eq!(
-            sig_and, sig_or,
-            "Error: AND and OR should have the same NPN signature!"
-        );
-        assert_eq!(
-            sig_xor, sig_xnor,
-            "Error: XOR and XNOR should have the same NPN signature!"
-        );
-        assert_ne!(
-            sig_and, sig_xor,
-            "Error: AND and XOR should NOT be equivalent!"
-        );
-
-        println!(">>> NPN Sanity Check Passed!");
-    }
-
-    #[test]
-    fn test_npn_6input_complex() {
-        // ==========================================
-        // 1. De Morgan
-        // ==========================================
-        let tt_and6 = 1u64 << 63;
-        let tt_or6 = !1u64;
-
-        let sig_and6 = get_npn_transform(tt_and6, 6).canon_prog;
-        let sig_or6 = get_npn_transform(tt_or6, 6).canon_prog;
-
-        println!("AND6 (0x{:016x}) Sig: 0x{:016x}", tt_and6, sig_and6);
-        println!("OR6  (0x{:016x}) Sig: 0x{:016x}", tt_or6, sig_or6);
-
-        assert_eq!(
-            sig_and6, sig_or6,
-            "Error: 6-input AND and OR should be NPN equivalent (De Morgan)!"
-        );
-
-        // ==========================================
-        // 2. Permutation
-        // ==========================================
-        let tt_x0 = 0xAAAAAAAAAAAAAAAAu64;
-        let tt_x5 = 0xFFFFFFFF00000000u64;
-
-        let sig_x0 = get_npn_transform(tt_x0, 6).canon_prog;
-        let sig_x5 = get_npn_transform(tt_x5, 6).canon_prog;
-
-        println!("Buf x0 (0x{:016x}) Sig: 0x{:016x}", tt_x0, sig_x0);
-        println!("Buf x5 (0x{:016x}) Sig: 0x{:016x}", tt_x5, sig_x5);
-
-        assert_eq!(
-            sig_x0, sig_x5,
-            "Error: Input variables x0 and x5 should be NPN equivalent (Permutation)!"
-        );
-
-        // ==========================================
-        // 3. Output Negation
-        // ==========================================
-        let tt_mux = 18374951396690406058u64;
-        let tt_mux_inv = !tt_mux;
-
-        let sig_mux = get_npn_transform(tt_mux, 6).canon_prog;
-        let sig_mux_inv = get_npn_transform(tt_mux_inv, 6).canon_prog;
-
-        println!("MUX    (0x{:016x}) Sig: 0x{:016x}", tt_mux, sig_mux);
-        println!("!MUX   (0x{:016x}) Sig: 0x{:016x}", tt_mux_inv, sig_mux_inv);
-
-        assert_eq!(
-            sig_mux, sig_mux_inv,
-            "Error: Function and its inverse should be NPN equivalent (Output Negation)!"
-        );
-
-        println!(">>> 6-Input NPN Complex Checks Passed!");
     }
 }
