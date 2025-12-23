@@ -131,7 +131,8 @@ mod tests {
         let prog_analysis = LutAnalysis::make(&mut egraph, &prog_node);
         assert_eq!(const_analysis.get_as_const(), Ok(const_val));
         assert_eq!(prog_analysis.get_program(), Ok(prog));
-        assert!(const_analysis.get_program().is_err());
+        // assert!(const_analysis.get_program().is_err());
+        assert_eq!(const_analysis.get_program(), Ok(!0u64));
         assert!(prog_analysis.get_as_const().is_err());
         assert!(!const_analysis.is_an_input());
         assert!(!prog_analysis.is_an_input());

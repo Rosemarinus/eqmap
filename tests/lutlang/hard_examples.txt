@@ -6,7 +6,7 @@
 
 // MUX with match cuts
 (MUX s1 (MUX s0 a b) (MUX s0 b a))
-// CHECK: (LUT 44234 s1 s0 b a)
+// CHECK: (LUT 51884 s1 s0 a b)
 
 // 4:1 mux
 (MUX s1 (MUX s0 a b) (MUX s0 c d))

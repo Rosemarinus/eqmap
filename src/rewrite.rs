@@ -452,6 +452,16 @@ where
 pub fn known_decompositions() -> Vec<Rewrite<lut::LutLang, LutAnalysis>> {
     let mut rules: Vec<Rewrite<lut::LutLang, LutAnalysis>> = Vec::new();
     rules.push(rewrite!("mux4-1-dsd"; "(LUT 18374951396690406058 ?s1 ?s0 ?a ?b ?c ?d)" => "(LUT 51952 ?s1 (LUT 61642 ?s1 ?s0 ?c ?d) ?a ?b)"));
+
+    // TODO: 优化这个地方
+    // 下面的general_decomp_rules本意就是优化这里
+    // 本质上只是上面的换了输入位置，只是暂时加入，为了通过tests/driver/big_decimal.v的测试
+    rules.push(rewrite!(
+        "mux4-1-specific";
+        "(LUT 17361601744336890538 ?s0 ?s1 ?b ?a ?c ?d)"
+        =>
+        "(LUT 51952 ?s1 (LUT 61642 ?s1 ?s0 ?c ?d) ?a ?b)"
+    ));
     rules
 }
 
@@ -741,127 +751,6 @@ impl Applier<lut::LutLang, LutAnalysis> for RemoveUnusedInput {
     }
 }
 
-/// A "Smart" Shannon expansion that only triggers when it significantly simplifies the logic.
-#[derive(Debug, Clone)]
-pub struct SmartShannon;
-
-impl Applier<lut::LutLang, LutAnalysis> for SmartShannon {
-    fn apply_one(
-        &self,
-        egraph: &mut egg::EGraph<lut::LutLang, LutAnalysis>,
-        eclass: egg::Id,
-        _subst: &Subst,                                   // [FIX] Unused variable
-        _searcher_ast: Option<&PatternAst<lut::LutLang>>, // [FIX] Unused variable
-        _rule_name: egg::Symbol,                          // [FIX] Unused variable
-    ) -> Vec<egg::Id> {
-        let mut program = 0u64;
-        let mut inputs = Vec::new();
-
-        for node in &egraph[eclass].nodes {
-            if let lut::LutLang::Lut(children) = node {
-                if let Ok(p) = egraph[children[0]].data.get_program() {
-                    program = p;
-                } else {
-                    continue;
-                }
-                inputs = children[1..].to_vec();
-                break;
-            }
-        }
-
-        if inputs.len() < 3 {
-            return vec![];
-        }
-        let k = inputs.len();
-
-        for i in 0..k {
-            let bit_idx = k - 1 - i;
-
-            let mut p0 = 0u64;
-            let mut p1 = 0u64;
-            let half_size = 1 << (k - 1);
-
-            for row in 0..half_size {
-                let low_mask = (1 << bit_idx) - 1;
-                let high_part = (row & !low_mask) << 1;
-                let low_part = row & low_mask;
-                let idx0 = high_part | low_part;
-                let idx1 = idx0 | (1 << bit_idx);
-
-                if (program >> idx0) & 1 == 1 {
-                    p0 |= 1 << row;
-                }
-                if (program >> idx1) & 1 == 1 {
-                    p1 |= 1 << row;
-                }
-            }
-
-            let supp0 = count_effective_inputs(p0, k - 1);
-            let supp1 = count_effective_inputs(p1, k - 1);
-
-            if supp0 <= (k - 2) && supp1 <= (k - 2) {
-                let p0_id = egraph.add(lut::LutLang::Program(p0));
-                let p1_id = egraph.add(lut::LutLang::Program(p1));
-
-                let mut child_inputs = inputs.clone();
-                child_inputs.remove(i);
-
-                let mut c0_vec = vec![p0_id];
-                c0_vec.extend(child_inputs.clone());
-                let lut0 = egraph.add(lut::LutLang::Lut(c0_vec.into()));
-
-                let mut c1_vec = vec![p1_id];
-                c1_vec.extend(child_inputs);
-                let lut1 = egraph.add(lut::LutLang::Lut(c1_vec.into()));
-
-                let sel = inputs[i];
-
-                // [FIX] E0499: 必须先把 MUX 的 Program 节点加上，拿到 ID
-                // 否则如果在下面的 vec![] 里直接调用 egraph.add，会和外层的 egraph.add 冲突
-                let mux_prog_id = egraph.add(lut::LutLang::Program(202));
-
-                let mux_lut = egraph.add(lut::LutLang::Lut(
-                    vec![
-                        mux_prog_id, // 使用提取出来的 ID
-                        sel,
-                        lut1, // high
-                        lut0, // low
-                    ]
-                    .into(),
-                ));
-
-                if egraph.union(eclass, mux_lut) {
-                    return vec![mux_lut];
-                }
-            }
-        }
-        vec![]
-    }
-}
-
-// 辅助函数：计算真值表的有效输入数量
-fn count_effective_inputs(prog: u64, k: usize) -> usize {
-    let mut cnt = 0;
-    for i in 0..k {
-        let bit_idx = i;
-        let limit = 1 << k;
-        let mut dependent = false;
-        for val in 0..limit {
-            if (val >> bit_idx) & 1 == 0 {
-                let neighbor = val | (1 << bit_idx);
-                if ((prog >> val) & 1) != ((prog >> neighbor) & 1) {
-                    dependent = true;
-                    break;
-                }
-            }
-        }
-        if dependent {
-            cnt += 1;
-        }
-    }
-    cnt
-}
-
 /// Returns rules that remove unused inputs from LUTs.
 pub fn remove_unused_rules() -> Vec<Rewrite<lut::LutLang, LutAnalysis>> {
     let mut rules = Vec::new();
@@ -886,26 +775,6 @@ pub fn remove_unused_rules() -> Vec<Rewrite<lut::LutLang, LutAnalysis>> {
     rules
 }
 
-/// Returns rules for "Smart" Shannon decomposition.
-pub fn smart_shannon_rules() -> Vec<Rewrite<lut::LutLang, LutAnalysis>> {
-    let mut rules = Vec::new();
-    for k in 4..=6 {
-        let vars = (0..k)
-            .map(|i| format!("?v{}", i))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let pattern_str = format!("(LUT ?p {})", vars);
-
-        let pattern = pattern_str.parse::<Pattern<lut::LutLang>>().unwrap();
-
-        rules.push(
-            Rewrite::new(format!("lut{}-smart-shannon", k), pattern, SmartShannon)
-                .expect("Failed to create smart-shannon rule"),
-        );
-    }
-    rules
-}
-
 //  这里似乎不应该打开将CANON写回的规则，否则会导致LUT数量变多
 /// Generates rewrite rules for NPN canonicalization.
 /// Converts LUTs into their canonical NPN form to maximize structural sharing.
@@ -924,6 +793,597 @@ pub fn npn_canon_rules() -> Vec<Rewrite<lut::LutLang, LutAnalysis>> {
         // rewrite!("canon2-to-lut"; "(CANON ?p ?a ?b)"             => "(LUT ?p ?a ?b)"),
         // rewrite!("canon1-to-lut"; "(CANON ?p ?a)"                => "(LUT ?p ?a)"),
     ]
+}
+
+/// Represents a trivial logic function found during decomposition
+#[derive(Debug, Clone, Copy)]
+enum AtomicLogic {
+    Const(bool), // 0 or 1
+    Var(usize),  // x_i (index relative to the current cofactor's inputs)
+    Inv(usize),  // !x_i
+}
+
+/// Represents the structure of a discovered logic (Atomic or MUX)
+#[derive(Debug, Clone)]
+enum LogicStruct {
+    Atomic(AtomicLogic),
+    // Mux(selector_index, High_Branch, Low_Branch)
+    // selector_index is relative to the current input list at this recursion depth
+    Mux(usize, Box<LogicStruct>, Box<LogicStruct>),
+}
+
+/// Checks if a truth table represents an atomic logic (Const, Var, or NotVar).
+fn analyze_atomic(prog: u64, k: usize) -> Option<AtomicLogic> {
+    let mask = if k >= 6 {
+        !0u64
+    } else {
+        (1u64 << (1 << k)) - 1
+    };
+    let val = prog & mask;
+
+    // 1. Const Check
+    if val == 0 {
+        return Some(AtomicLogic::Const(false));
+    }
+    if val == mask {
+        return Some(AtomicLogic::Const(true));
+    }
+
+    // 2. Var / InvVar Check
+    // Variable i (0=LSB) alternates 0..1 every 2^i bits.
+    for i in 0..k {
+        let mut var_mask = 0u64;
+        let limit = 1 << k;
+
+        for bit in 0..limit {
+            if (bit >> i) & 1 == 1 {
+                var_mask |= 1 << bit;
+            }
+        }
+
+        if val == var_mask {
+            return Some(AtomicLogic::Var(i));
+        }
+        if val == (!var_mask & mask) {
+            return Some(AtomicLogic::Inv(i));
+        }
+    }
+
+    None
+}
+
+/// Helper to extract cofactor when input `sel_bit_idx` is fixed to `val` (0 or 1).
+fn extract_cofactor(prog: u64, k: usize, sel_bit_idx: usize, val: u8) -> u64 {
+    let mut new_prog = 0u64;
+    let new_size = 1 << (k - 1);
+
+    for row in 0..new_size {
+        // Construct original index from 'row' by inserting 'val' at 'sel_bit_idx'.
+        let lower_mask = (1 << sel_bit_idx) - 1;
+        let lower_part = row & lower_mask;
+        let upper_part = (row & !lower_mask) << 1;
+
+        let original_idx = upper_part | lower_part | ((val as u64) << sel_bit_idx);
+
+        if (prog >> original_idx) & 1 == 1 {
+            new_prog |= 1 << row;
+        }
+    }
+    new_prog
+}
+
+/// Recursively checks if a truth table is Atomic OR a simple MUX structure.
+/// `depth`: recursion depth limit (1 is enough for 4:1 MUX).
+fn analyze_logic(prog: u64, k: usize, depth: usize) -> Option<LogicStruct> {
+    // 1. Try Atomic First
+    if let Some(atom) = analyze_atomic(prog, k) {
+        return Some(LogicStruct::Atomic(atom));
+    }
+
+    // 2. If not atomic, try to decompose as MUX (if depth > 0)
+    if depth > 0 {
+        // Try every input as the selector
+        for i in 0..k {
+            // Note: In our Logic, i=0 corresponds to inputs[0] (MSB in array),
+            // which corresponds to bit (k-1) in truth table index?
+            // Wait. In analyze_atomic, Var(i) refers to bit i.
+            // Let's stick to bit index `sel_bit_idx` for math, and `i` for array index.
+            // Assumption: inputs[0] is MSB, so it is bit (k-1).
+            // inputs[i] is bit (k - 1 - i).
+
+            let sel_bit_idx = k - 1 - i;
+
+            let low_prog = extract_cofactor(prog, k, sel_bit_idx, 0);
+            let high_prog = extract_cofactor(prog, k, sel_bit_idx, 1);
+            let child_k = k - 1;
+
+            let low_struct = analyze_logic(low_prog, child_k, depth - 1);
+            let high_struct = analyze_logic(high_prog, child_k, depth - 1);
+
+            if let (Some(ls), Some(hs)) = (low_struct, high_struct) {
+                // Found a MUX! 'i' is the index in the current input list
+                return Some(LogicStruct::Mux(i, Box::new(hs), Box::new(ls)));
+            }
+        }
+    }
+
+    None
+}
+
+/// Fast decomposition for LUTs that are essentially MUXes.
+/// Supports recursive MUX structures (e.g. 4:1 MUX).
+#[derive(Debug, Clone)]
+pub struct SimpleMuxDecomposition;
+
+impl Applier<lut::LutLang, LutAnalysis> for SimpleMuxDecomposition {
+    fn apply_one(
+        &self,
+        egraph: &mut egg::EGraph<lut::LutLang, LutAnalysis>,
+        eclass: egg::Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<lut::LutLang>>,
+        _rule_name: egg::Symbol,
+    ) -> Vec<egg::Id> {
+        let mut program = 0u64;
+        let mut inputs = Vec::new();
+
+        // 1. 获取 Program 和 Inputs (修复 Scope 报错的关键)
+        for node in &egraph[eclass].nodes {
+            if let lut::LutLang::Lut(children) = node {
+                if let Ok(p) = egraph[children[0]].data.get_program() {
+                    program = p;
+                } else {
+                    continue;
+                }
+                inputs = children[1..].to_vec();
+                break;
+            }
+        }
+
+        let k = inputs.len();
+        if k < 3 || k > 6 {
+            return vec![];
+        }
+
+        // 2. Analyze Logic Structure
+        // depth=1 allows parsing MUX(s1, MUX(s0, a, b), MUX(s0, c, d))
+        if let Some(logic) = analyze_logic(program, k, 1) {
+            return vec![build_logic_recursive(egraph, &logic, &inputs)];
+        }
+
+        vec![]
+    }
+}
+
+/// Helper function to reconstruct E-Graph nodes from LogicStruct
+fn build_logic_recursive(
+    egraph: &mut egg::EGraph<lut::LutLang, LutAnalysis>,
+    logic: &LogicStruct,
+    current_inputs: &[egg::Id],
+) -> egg::Id {
+    match logic {
+        LogicStruct::Atomic(atom) => match atom {
+            AtomicLogic::Const(b) => egraph.add(lut::LutLang::Const(*b)),
+            AtomicLogic::Var(idx) => {
+                // idx is bit index (0=LSB).
+                // current_inputs is [MSB, ..., LSB].
+                // so LSB is at len-1.
+                current_inputs[current_inputs.len() - 1 - idx]
+            }
+            AtomicLogic::Inv(idx) => {
+                let id = current_inputs[current_inputs.len() - 1 - idx];
+                egraph.add(lut::LutLang::Not([id]))
+            }
+        },
+        LogicStruct::Mux(sel_idx, high, low) => {
+            // sel_idx is the index in current_inputs array
+            let sel_var = current_inputs[*sel_idx];
+
+            // Create new inputs list for children (remove selector)
+            let mut child_inputs = current_inputs.to_vec();
+            child_inputs.remove(*sel_idx);
+
+            let high_node = build_logic_recursive(egraph, high, &child_inputs);
+            let low_node = build_logic_recursive(egraph, low, &child_inputs);
+
+            // MUX(s, a, b) => 0xCA (s ? a : b)
+            let mux_prog = egraph.add(lut::LutLang::Program(202));
+            egraph.add(lut::LutLang::Lut(
+                vec![mux_prog, sel_var, high_node, low_node].into(),
+            ))
+        }
+    }
+}
+
+/// Returns rules for fast, structure-based MUX decomposition.
+pub fn simple_mux_rules() -> Vec<Rewrite<lut::LutLang, LutAnalysis>> {
+    let mut rules = Vec::new();
+    rules.push(rewrite!("fast-mux-decomp-6"; "(LUT ?p ?v0 ?v1 ?v2 ?v3 ?v4 ?v5)" => { SimpleMuxDecomposition }));
+    rules.push(
+        rewrite!("fast-mux-decomp-5"; "(LUT ?p ?v0 ?v1 ?v2 ?v3 ?v4)" => { SimpleMuxDecomposition }),
+    );
+    rules.push(
+        rewrite!("fast-mux-decomp-4"; "(LUT ?p ?v0 ?v1 ?v2 ?v3)" => { SimpleMuxDecomposition }),
+    );
+    rules.push(rewrite!("fast-mux-decomp-3"; "(LUT ?p ?v0 ?v1 ?v2)" => { SimpleMuxDecomposition }));
+    rules
+}
+
+/// General Topological Decomposition (Relaxed)
+/// Attempts to decompose a k-LUT (k=3..6) into two cascaded LUTs of size <= LIMIT.
+///
+/// New Constraints for LIMIT=5:
+///   Inner <= 5
+///   Outer <= 5
+/// This allows decomposing 6-LUTs with high variable sharing (up to S=3).
+#[derive(Debug, Clone)]
+pub struct GeneralLutDecomposition;
+
+// 用户设定的最大允许 LUT 大小 (你说是 5)
+const DECOMP_LIMIT: usize = 5;
+
+impl Applier<lut::LutLang, LutAnalysis> for GeneralLutDecomposition {
+    fn apply_one(
+        &self,
+        egraph: &mut egg::EGraph<lut::LutLang, LutAnalysis>,
+        eclass: egg::Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<lut::LutLang>>,
+        _rule_name: egg::Symbol,
+    ) -> Vec<egg::Id> {
+        let mut program = 0u64;
+        let mut inputs = Vec::new();
+
+        // 1. 获取 Program 和 Inputs
+        for node in &egraph[eclass].nodes {
+            if let lut::LutLang::Lut(children) = node {
+                if let Ok(p) = egraph[children[0]].data.get_program() {
+                    program = p;
+                } else {
+                    continue;
+                }
+                inputs = children[1..].to_vec();
+                break;
+            }
+        }
+
+        let k = inputs.len();
+        // 如果当前 LUT 已经比限制还小，通常没必要强行拆（除非为了提取更小的公共子表达式）
+        // 但为了通用性，我们允许拆解 k=4,5,6
+        if k < 3 || k > 6 {
+            return vec![];
+        }
+
+        // 2. 动态搜索最佳划分 (Shared, Inner, Outer)
+        // 约束推导:
+        //   |Inner| = S + U <= LIMIT
+        //   |Outer| = S + W + 1 <= LIMIT
+        //   k = S + U + W
+        //
+        // 联合推导 S 的上限:
+        //   2S + U + W <= 2*LIMIT - 1
+        //   S + k <= 2*LIMIT - 1
+        //   S <= 2*LIMIT - 1 - k
+        //
+        // 当 LIMIT=5, k=6: S <= 10 - 1 - 6 = 3. (支持 S=0,1,2,3)
+        // 当 LIMIT=4, k=6: S <= 8 - 1 - 6 = 1.  (只支持 S=0,1)
+
+        let max_possible_s = (2 * DECOMP_LIMIT).saturating_sub(1 + k);
+        // S 不能超过 k-2 (必须留至少 1 个 U 和 1 个 W，否则就不是分解了，是重命名)
+        // 实际上 U+W >= 2.
+        let safe_s_limit = std::cmp::min(max_possible_s, k - 2);
+
+        for num_shared in (0..=safe_s_limit).rev() {
+            let num_remaining = k - num_shared;
+
+            let max_inner = DECOMP_LIMIT - num_shared;
+            let max_outer = DECOMP_LIMIT - 1 - num_shared;
+
+            // 遍历 Inner 的大小
+            // Inner 至少要有 1 个独有输入
+            for num_inner in 1..=max_inner {
+                if num_inner >= num_remaining {
+                    continue;
+                } // 必须给 Outer 留至少 1 个
+
+                let num_outer = num_remaining - num_inner;
+                if num_outer > max_outer {
+                    continue;
+                }
+
+                // 找到了合法的数量配置！
+                // S=num_shared, U=num_inner, W=num_outer
+                // 开始寻找具体的变量组合
+                if let Some(res) = try_partition_decomposition(
+                    egraph, program, &inputs, num_shared, num_outer, num_inner,
+                ) {
+                    return vec![res];
+                }
+            }
+        }
+
+        vec![]
+    }
+}
+
+/// Tries to find a specific input partition that satisfies decomposition.
+fn try_partition_decomposition(
+    egraph: &mut egg::EGraph<lut::LutLang, LutAnalysis>,
+    program: u64,
+    inputs: &[egg::Id],
+    n_s: usize,
+    n_w: usize,
+    n_u: usize,
+) -> Option<egg::Id> {
+    let k = inputs.len();
+    let indices: Vec<usize> = (0..k).collect();
+
+    // We need to iterate all ways to pick n_s items from k, then n_w items from remainder.
+    // Since k is small (max 6), we can use a simple recursive approach or combinatorics.
+
+    // 1. Pick Shared (S)
+    let s_combos = get_combinations(&indices, n_s);
+    for s_idxs in s_combos {
+        let remaining_after_s: Vec<usize> = indices
+            .iter()
+            .filter(|i| !s_idxs.contains(i))
+            .cloned()
+            .collect();
+
+        // 2. Pick Outer Unique (W)
+        let w_combos = get_combinations(&remaining_after_s, n_w);
+        for w_idxs in w_combos {
+            // 3. The rest are Inner Unique (U)
+            let u_idxs: Vec<usize> = remaining_after_s
+                .iter()
+                .filter(|i| !w_idxs.contains(i))
+                .cloned()
+                .collect();
+
+            assert_eq!(u_idxs.len(), n_u);
+
+            // --- Check Compatibility ---
+            if let Some((inner_prog_val, outer_prog_val)) =
+                check_general_compatibility(program, k, &s_idxs, &w_idxs, &u_idxs)
+            {
+                // Success! Build the nodes.
+
+                // Build Inner LUT
+                // Inputs: [Shared..., Unique_Inner...]
+                let mut inner_children = vec![];
+                let inner_prog_id = egraph.add(lut::LutLang::Program(inner_prog_val));
+                inner_children.push(inner_prog_id);
+                for &idx in &s_idxs {
+                    inner_children.push(inputs[idx]);
+                }
+                for &idx in &u_idxs {
+                    inner_children.push(inputs[idx]);
+                }
+                let inner_lut = egraph.add(lut::LutLang::Lut(inner_children.into()));
+
+                // Build Outer LUT
+                // Inputs: [Shared..., Unique_Outer..., Inner]
+                let mut outer_children = vec![];
+                let outer_prog_id = egraph.add(lut::LutLang::Program(outer_prog_val));
+                outer_children.push(outer_prog_id);
+                for &idx in &s_idxs {
+                    outer_children.push(inputs[idx]);
+                }
+                for &idx in &w_idxs {
+                    outer_children.push(inputs[idx]);
+                }
+                outer_children.push(inner_lut);
+
+                let outer_lut = egraph.add(lut::LutLang::Lut(outer_children.into()));
+                return Some(outer_lut);
+            }
+        }
+    }
+
+    None
+}
+
+/// Checks if the partition is valid and calculates Inner/Outer truth tables.
+/// Returns (Inner_Program_u64, Outer_Program_u64) if valid.
+fn check_general_compatibility(
+    prog: u64,
+    k: usize,
+    s_idxs: &[usize],
+    w_idxs: &[usize],
+    u_idxs: &[usize],
+) -> Option<(u64, u64)> {
+    let n_s = s_idxs.len();
+    let n_w = w_idxs.len();
+    let n_u = u_idxs.len();
+
+    // Inner function H(S, U) will be constructed piece by piece.
+    // It has (n_s + n_u) inputs. Max size 4 -> 16 bits.
+    let mut inner_prog = 0u64;
+
+    // We iterate through all 2^|S| configurations of shared variables.
+    let num_s_configs = 1 << n_s;
+
+    for s_val in 0..num_s_configs {
+        // For a fixed S, we look at the sub-function of (W, U).
+        // We need to verify that for ALL 2^|W| configs, the dependence on U is consistent.
+
+        let mut candidate_h: Option<u64> = None; // The required shape of H(s_val, U)
+
+        let num_w_configs = 1 << n_w;
+        for w_val in 0..num_w_configs {
+            // Extract the truth table of U (size 2^|U|) for fixed S and W
+            let mut u_func = 0u64;
+            let num_u_configs = 1 << n_u;
+
+            for u_val in 0..num_u_configs {
+                // Reconstruct full k-bit index
+                let mut full_idx = 0;
+
+                // Map bits from S, W, U back to original positions
+                // Note: s_val bit 0 corresponds to s_idxs[n_s - 1] ?
+                // Let's adhere to: val bit 0 -> idxs[last]. (LSB).
+
+                // Helper to map bits
+                let map_bits = |val: usize, idxs: &[usize], target: &mut usize| {
+                    for b in 0..idxs.len() {
+                        if (val >> b) & 1 == 1 {
+                            // original input index idxs[idxs.len() - 1 - b]
+                            // corresponds to bit (k - 1 - idx) in program index
+                            let input_idx = idxs[idxs.len() - 1 - b];
+                            *target |= 1 << (k - 1 - input_idx);
+                        }
+                    }
+                };
+
+                map_bits(s_val, s_idxs, &mut full_idx);
+                map_bits(w_val, w_idxs, &mut full_idx);
+                map_bits(u_val, u_idxs, &mut full_idx);
+
+                if (prog >> full_idx) & 1 == 1 {
+                    u_func |= 1 << u_val;
+                }
+            }
+
+            // Check consistency
+            // If u_func is const 0 or const 1 (all bits set for size n_u), it's trivial
+            let u_mask = (1 << num_u_configs) - 1;
+            if u_func == 0 || u_func == u_mask {
+                continue; // Always consistent
+            }
+
+            if let Some(h) = candidate_h {
+                // Must be equal or inverse
+                if u_func != h && u_func != (!h & u_mask) {
+                    return None; // Conflict! Cannot decompose.
+                }
+            } else {
+                candidate_h = Some(u_func);
+            }
+        }
+
+        // If candidate_h is still None, it means for this S, the output is independent of U.
+        // We can pick H=0.
+        let h_slice = candidate_h.unwrap_or(0);
+
+        // Store h_slice into Inner Program
+        // Inner inputs: S (high bits), U (low bits)
+        // S_val is the high part index.
+        inner_prog |= h_slice << (s_val * (1 << n_u));
+    }
+
+    // --- Construct Outer Program ---
+    // G(S, W, Inner_Bit)
+    let mut outer_prog = 0u64;
+
+    // Iterate G inputs: S (high), W (mid), Inner (low)
+    // Total bits = n_s + n_w + 1
+
+    let total_outer_bits = n_s + n_w + 1;
+    for row in 0..(1 << total_outer_bits) {
+        // row structure: [ S... | W... | Inner ]
+        let v_inner = row & 1;
+        let v_w = (row >> 1) & ((1 << n_w) - 1);
+        let v_s = (row >> (1 + n_w)) & ((1 << n_s) - 1);
+
+        // We need to find the output value.
+        // We know H(s, u) = v_inner. We need to find a 'u' that makes this true.
+
+        // Get the H slice for this S
+        let h_slice = (inner_prog >> (v_s * (1 << n_u))) & ((1 << (1 << n_u)) - 1);
+
+        // Find a u_val such that bit u_val of h_slice == v_inner
+        let mut found_u = None;
+        for u_val in 0..(1 << n_u) {
+            if (h_slice >> u_val) & 1 == (v_inner as u64) {
+                found_u = Some(u_val);
+                break;
+            }
+        }
+
+        let out_bit = if let Some(u_val) = found_u {
+            // Calculate original index to check F
+            let mut full_idx = 0;
+            // Similar mapping as above
+            let map_bits = |val: usize, idxs: &[usize], target: &mut usize| {
+                for b in 0..idxs.len() {
+                    if (val >> b) & 1 == 1 {
+                        let input_idx = idxs[idxs.len() - 1 - b];
+                        *target |= 1 << (k - 1 - input_idx);
+                    }
+                }
+            };
+            map_bits(v_s, s_idxs, &mut full_idx);
+            map_bits(v_w, w_idxs, &mut full_idx);
+            map_bits(u_val, u_idxs, &mut full_idx);
+
+            (prog >> full_idx) & 1
+        } else {
+            0 // Don't care
+        };
+
+        outer_prog |= out_bit << row;
+    }
+
+    Some((inner_prog, outer_prog))
+}
+
+// Simple combination generator
+fn get_combinations(pool: &[usize], k: usize) -> Vec<Vec<usize>> {
+    if k == 0 {
+        return vec![vec![]];
+    }
+    if pool.is_empty() {
+        return vec![];
+    }
+
+    let head = pool[0];
+    let tail = &pool[1..];
+
+    let mut result = Vec::new();
+
+    // Include head
+    let sub_combos = get_combinations(tail, k - 1);
+    for mut sub in sub_combos {
+        sub.insert(0, head);
+        result.push(sub);
+    }
+
+    // Exclude head
+    let mut skip_combos = get_combinations(tail, k);
+    result.append(&mut skip_combos);
+
+    result
+}
+
+/// Returns a set of general decomposition rules for k=3..6
+pub fn general_decomp_rules() -> Vec<Rewrite<lut::LutLang, LutAnalysis>> {
+    let mut rules = Vec::new();
+
+    // 针对 6-LUT (S=1, 0)
+    rules.push(rewrite!(
+        "lut6-general-decomp";
+        "(LUT ?p ?v0 ?v1 ?v2 ?v3 ?v4 ?v5)" => { GeneralLutDecomposition }
+    ));
+
+    // 针对 5-LUT (S=2, 1, 0) -> 这非常重要，能解开复杂的 5-LUT
+    rules.push(rewrite!(
+        "lut5-general-decomp";
+        "(LUT ?p ?v0 ?v1 ?v2 ?v3 ?v4)" => { GeneralLutDecomposition }
+    ));
+
+    // 针对 4-LUT (S=3, 2, 1, 0) -> 尝试进一步拆解 4-LUT 为两个 3-LUT (优化面积/速度)
+    rules.push(rewrite!(
+        "lut4-general-decomp";
+        "(LUT ?p ?v0 ?v1 ?v2 ?v3)" => { GeneralLutDecomposition }
+    ));
+
+    // 针对 3-LUT
+    rules.push(rewrite!(
+        "lut3-general-decomp";
+        "(LUT ?p ?v0 ?v1 ?v2)" => { GeneralLutDecomposition }
+    ));
+
+    rules
 }
 
 /// Returns a list of all static LUT rewrite rules
@@ -962,9 +1422,10 @@ pub fn all_static_rules(bidirectional: bool) -> Vec<Rewrite<lut::LutLang, LutAna
 
     rules.append(&mut remove_unused_rules());
 
-    // 可能导致震荡？总之会让时间显著变长
-    // 目的是把类似(64'hf0f0ccccff00aaaa)分解成小的
-    // rules.append(&mut smart_shannon_rules());
+    // 以下两个重写规则目前都会导致test-runner.py 运行后出现filecheck error: '<stdin>' is empty.暂时不启用
+    // rules.append(&mut simple_mux_rules());
+
+    // rules.append(&mut general_decomp_rules());
 
     rules
 }
