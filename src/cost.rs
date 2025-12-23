@@ -66,6 +66,7 @@ impl CostFunction<LutLang> for KLUTCostFn {
 
             // LutLang::Canonical(_) => u64::MAX,
             LutLang::Canonical(_) => 1_000_000,
+            // LutLang::Canonical(_) => 2,
             _ => u64::MAX,
         };
         enode.fold(op_cost, |sum, id| sum.saturating_add(costs(id)))

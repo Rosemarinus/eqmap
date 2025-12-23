@@ -36,6 +36,8 @@ if __name__ == "__main__":
     directory = args.directory.strip().rstrip("/")
     for root, _dirs, files in os.walk(directory):
         for file in files:
+            if file.startswith("."):
+                continue
             path = os.path.join(root, file)
             with open(path, "r") as f:
                 lines = f.readlines()

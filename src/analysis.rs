@@ -182,12 +182,12 @@ impl Analysis<lut::LutLang> for LutAnalysis {
             // Later we will want to relax this condition for constant folding.
             // For now, it is a good sanity check.
             // panic!("Cannot merge constant type with non-constant type.");
-            println!("Cannot merge constant type with non-constant type.");
+            eprintln!("Cannot merge constant type with non-constant type.");
         }
         if !(to.input == from.input || to.input.is_none() || from.input.is_none()) {
             // Later, we will want to relax this condition when we're okay with input aliasing.
             // panic!("Cannot merge input type with non-input type.");
-            println!("Cannot merge input type with non-input type.");
+            eprintln!("Cannot merge input type with non-input type.");
         }
 
         let mut merged = to.clone();

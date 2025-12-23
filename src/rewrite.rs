@@ -419,9 +419,7 @@ pub fn general_cut_fusion() -> Vec<Rewrite<lut::LutLang, LutAnalysis>> {
     for p in 2..=6 {
         for q in 1..=6 {
             for pos in 0..p {
-                if (p - 1) + q <= 6 {
-                    rules.push(p_q_pos_cut_fuse(p, q, pos));
-                }
+                rules.push(p_q_pos_cut_fuse(p, q, pos));
             }
         }
     }
@@ -670,7 +668,7 @@ pub fn all_static_rules(bidirectional: bool) -> Vec<Rewrite<lut::LutLang, LutAna
     rules.push(rewrite!("double-complement"; "(NOT (NOT ?a))" => "?a"));
 
     // LUT permutation groups
-    // rules.append(&mut permute_groups());
+    rules.append(&mut permute_groups());
 
     rules.append(&mut redundant_inputs());
     rules.append(&mut condense_cofactors());
