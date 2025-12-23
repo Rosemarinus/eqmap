@@ -25,5 +25,5 @@ run_benchmarks.sh
 parse_reports.py
 report.json
 results.csv
-results_*.md
+results*.md
 output.v
